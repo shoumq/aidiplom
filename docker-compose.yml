@@ -1,0 +1,85 @@
+services:
+  backend-permissions:
+    image: aidiplom-backend:local
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    user: "0:0"
+    command: ["chown", "-R", "10001:10001", "/app/data"]
+    volumes:
+      - writer-data:/app/data
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+    restart: "no"
+
+  backend:
+    image: aidiplom-backend:local
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    restart: unless-stopped
+    environment:
+      AITUNNEL_API_KEY: ${AITUNNEL_API_KEY:-}
+      CHATS_FILE: /app/data/chats.json
+      AUTH_DB: /app/data/auth.db
+      COOKIE_SECURE: ${COOKIE_SECURE:-0}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
+      DATA_RETENTION_DAYS: ${DATA_RETENTION_DAYS:-365}
+      ALLOW_MOCK_PAY: ${ALLOW_MOCK_PAY:-1}
+      AITUNNEL_TIMEOUT: ${AITUNNEL_TIMEOUT:-900}
+      AITUNNEL_MAX_RETRIES: ${AITUNNEL_MAX_RETRIES:-5}
+    volumes:
+      - writer-data:/app/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,noexec,nosuid,nodev
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 200
+    mem_limit: 1g
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/meta')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    depends_on:
+      backend-permissions:
+        condition: service_completed_successfully
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    restart: unless-stopped
+    environment:
+      NUXT_PUBLIC_API_BASE: ${NUXT_PUBLIC_API_BASE:-http://localhost:8000/api}
+      NUXT_PUBLIC_OPERATOR_NAME: ${NUXT_PUBLIC_OPERATOR_NAME:-}
+      NUXT_PUBLIC_OPERATOR_EMAIL: ${NUXT_PUBLIC_OPERATOR_EMAIL:-}
+      NUXT_PUBLIC_OPERATOR_ADDRESS: ${NUXT_PUBLIC_OPERATOR_ADDRESS:-}
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,noexec,nosuid,nodev
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 100
+    mem_limit: 512m
+    ports:
+      - "3000:3000"
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  writer-data:
