@@ -188,7 +188,7 @@
 .account-block a:hover { color: #293f78; }
 .account-block .delete-account { color: #9b4553; }
 
-.legal-page { min-height: 100vh; padding: 44px 24px 80px; background: #f3f4f6; color: #252932; }
+.legal-page { height: 100%; min-height: 100vh; min-height: 100dvh; overflow-y: auto; overscroll-behavior-y: contain; -webkit-overflow-scrolling: touch; padding: 44px 24px 80px; background: #f3f4f6; color: #252932; }
 .legal-page article { width: min(760px, 100%); margin: 18px auto 0; padding: 48px 56px; border: 1px solid #dfe1e5; background: #fff; box-shadow: 0 12px 45px rgba(28, 32, 42, .06); }
 .legal-back { display: block; width: min(760px, 100%); margin: 0 auto; color: #59606d; font-size: 13px; text-decoration: none; }
 .legal-page h1 { margin: 0 0 8px; font-size: 31px; line-height: 1.15; letter-spacing: -.035em; }
