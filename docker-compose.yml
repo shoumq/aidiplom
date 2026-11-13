@@ -62,7 +62,7 @@ services:
       dockerfile: frontend/Dockerfile
     restart: unless-stopped
     environment:
-      NUXT_PUBLIC_API_BASE: ${NUXT_PUBLIC_API_BASE:-http://localhost:8000/api}
+      NUXT_PUBLIC_API_BASE: ${NUXT_PUBLIC_API_BASE:-/api}
       NUXT_PUBLIC_OPERATOR_NAME: ${NUXT_PUBLIC_OPERATOR_NAME:-}
       NUXT_PUBLIC_OPERATOR_EMAIL: ${NUXT_PUBLIC_OPERATOR_EMAIL:-}
       NUXT_PUBLIC_OPERATOR_ADDRESS: ${NUXT_PUBLIC_OPERATOR_ADDRESS:-}
@@ -76,7 +76,7 @@ services:
     pids_limit: 100
     mem_limit: 512m
     ports:
-      - "3000:3000"
+      - "80:3000"
     depends_on:
       backend:
         condition: service_healthy

@@ -4,7 +4,7 @@ export default defineNuxtConfig({
   modules: ['@nuxt/icon'],
   css: ['~/assets/css/main.css', '~/assets/css/logo.css'],
   runtimeConfig: { public: {
-    apiBase: process.env.NUXT_PUBLIC_API_BASE || 'http://localhost:8000/api',
+    apiBase: process.env.NUXT_PUBLIC_API_BASE || '/api',
     operatorName: process.env.NUXT_PUBLIC_OPERATOR_NAME || '[Укажите ФИО ИП/самозанятого или название организации]',
     operatorEmail: process.env.NUXT_PUBLIC_OPERATOR_EMAIL || '[Укажите email оператора]',
     operatorAddress: process.env.NUXT_PUBLIC_OPERATOR_ADDRESS || '[Укажите адрес оператора]'
