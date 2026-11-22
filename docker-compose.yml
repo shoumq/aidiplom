@@ -24,17 +24,22 @@ services:
       dockerfile: backend/Dockerfile
     restart: unless-stopped
     environment:
+      YOOKASSA_SHOP_ID: ${YOOKASSA_SHOP_ID:-}
+      YOOKASSA_SECRET_KEY: ${YOOKASSA_SECRET_KEY:-}
+      PAYMENT_RETURN_URL: ${PAYMENT_RETURN_URL:-}
+      LEGAL_DIR: /app/legal
       AITUNNEL_API_KEY: ${AITUNNEL_API_KEY:-}
       CHATS_FILE: /app/data/chats.json
       AUTH_DB: /app/data/auth.db
       COOKIE_SECURE: ${COOKIE_SECURE:-0}
-      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost,http://127.0.0.1,http://localhost:3000,http://127.0.0.1:3000}
       DATA_RETENTION_DAYS: ${DATA_RETENTION_DAYS:-365}
       ALLOW_MOCK_PAY: ${ALLOW_MOCK_PAY:-1}
       AITUNNEL_TIMEOUT: ${AITUNNEL_TIMEOUT:-900}
       AITUNNEL_MAX_RETRIES: ${AITUNNEL_MAX_RETRIES:-5}
     volumes:
       - writer-data:/app/data
+      - ./legal:/app/legal:ro
     read_only: true
     tmpfs:
       - /tmp:size=64m,noexec,nosuid,nodev
@@ -45,7 +50,7 @@ services:
     pids_limit: 200
     mem_limit: 1g
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/meta')"]
       interval: 10s
@@ -62,6 +67,7 @@ services:
       dockerfile: frontend/Dockerfile
     restart: unless-stopped
     environment:
+      NUXT_API_UPSTREAM: http://backend:8000
       NUXT_PUBLIC_API_BASE: ${NUXT_PUBLIC_API_BASE:-/api}
       NUXT_PUBLIC_OPERATOR_NAME: ${NUXT_PUBLIC_OPERATOR_NAME:-}
       NUXT_PUBLIC_OPERATOR_EMAIL: ${NUXT_PUBLIC_OPERATOR_EMAIL:-}

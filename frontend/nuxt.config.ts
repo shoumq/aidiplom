@@ -3,7 +3,8 @@ export default defineNuxtConfig({
   devtools: { enabled: false },
   modules: ['@nuxt/icon'],
   css: ['~/assets/css/main.css', '~/assets/css/logo.css'],
-  runtimeConfig: { public: {
+  icon: { serverBundle: { collections: ['lucide'] } },
+  runtimeConfig: { apiUpstream: 'http://127.0.0.1:8000', public: {
     apiBase: process.env.NUXT_PUBLIC_API_BASE || '/api',
     operatorName: process.env.NUXT_PUBLIC_OPERATOR_NAME || '[Укажите ФИО ИП/самозанятого или название организации]',
     operatorEmail: process.env.NUXT_PUBLIC_OPERATOR_EMAIL || '[Укажите email оператора]',

@@ -1,3 +1,6 @@
+from decimal import Decimal, InvalidOperation
+from backend import yookassa
+import asyncio
 import json
 import hashlib
 import hmac
@@ -13,6 +16,7 @@ import threading
 import time
 import uuid
 from collections import defaultdict, deque
+from contextlib import asynccontextmanager, suppress
 from datetime import date
 from io import BytesIO
 from pathlib import Path
@@ -37,6 +41,9 @@ COOKIE_SECURE = os.getenv("COOKIE_SECURE", "0") == "1"
 ALLOW_MOCK_PAY = os.getenv("ALLOW_MOCK_PAY", "1") == "1"
 ALLOWED_ORIGINS = {value.strip() for value in os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",") if value.strip()}
 DATA_RETENTION_DAYS = int(os.getenv("DATA_RETENTION_DAYS", "365"))
+DELETED_CHAT_RETENTION = 14 * 24 * 60 * 60
+REFERRAL_REWARD_RUB = 150
+LEGAL_DIR = Path(os.getenv("LEGAL_DIR", "/app/legal"))
 PRIVACY_VERSION = "2026-10-29"
 LOCK = threading.RLock()
 RATE_LOCK = threading.Lock()
@@ -154,6 +161,7 @@ class QuoteRequest(BaseModel):
 
 class WriteRequest(BaseModel):
     settings: Settings
+    section_indices: list[int] | None = Field(default=None, min_length=1, max_length=100)
 
 
 class ReviseRequest(BaseModel):
@@ -166,6 +174,14 @@ class AuthRequest(BaseModel):
     email: str = Field(min_length=3, max_length=254)
     password: str = Field(min_length=8, max_length=128)
     privacy_accepted: bool = False
+    privacy_version: str | None = Field(default=None, max_length=64)
+    offer_version: str | None = Field(default=None, max_length=64)
+    referral_code: str = Field(default="", max_length=32)
+
+
+class PaymentRequest(BaseModel):
+    offer_version: str | None = Field(default=None, max_length=64)
+    credit_rub: int = Field(default=0, ge=0)
 
 
 def _auth_connection():
@@ -216,7 +232,69 @@ def _init_auth():
                 accepted_at INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS consents_user_id ON consents(user_id);
+            CREATE TABLE IF NOT EXISTS referrals (
+                invitee_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                inviter_id TEXT REFERENCES users(id) ON DELETE SET NULL
+            );
+            CREATE TABLE IF NOT EXISTS account_credits (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                amount_rub INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS account_credits_user_id ON account_credits(user_id);
+            CREATE TABLE IF NOT EXISTS yookassa_payments (
+                order_id TEXT PRIMARY KEY REFERENCES orders(id) ON DELETE CASCADE,
+                payment_id TEXT UNIQUE,
+                request_json TEXT NOT NULL,
+                credit_rub INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'creating',
+                confirmation_url TEXT
+            );
+            -- Older versions only supported simulated payment.
+            INSERT INTO account_credits(id,user_id,amount_rub,reason,created_at)
+                SELECT id,user_id,0,'test-order',paid_at FROM orders WHERE paid_at IS NOT NULL
+                AND NOT EXISTS (SELECT 1 FROM yookassa_payments WHERE order_id=orders.id)
+                ON CONFLICT(id) DO NOTHING;
         """)
+
+
+def _legal_document(kind: Literal["privacy", "offer"]):
+    path = LEGAL_DIR / f"{kind}.txt"
+    if not path.is_file():
+        return None
+    document = path.read_text(encoding="utf-8").strip()
+    if not document:
+        return None
+    return {"text": document, "version": hashlib.sha256(document.encode()).hexdigest()}
+
+
+def _accept_offer(connection, user_id, version, now):
+    offer = _legal_document("offer")
+    if offer is None and not ALLOW_MOCK_PAY:
+        raise HTTPException(503, "Публичная оферта ещё не опубликована")
+    if offer and version != offer["version"]:
+        raise HTTPException(422, "Ознакомьтесь с действующей офертой и примите её условия")
+    if offer:
+        connection.execute(
+            "INSERT INTO consents(id,user_id,document,version,accepted_at) VALUES(?,?,?,?,?)",
+            (uuid.uuid4().hex, user_id, "offer", version, now),
+        )
+
+
+def _credit_balance(connection, user_id):
+    return connection.execute(
+        """SELECT COALESCE(SUM(amount_rub), 0) FROM account_credits
+           WHERE user_id=? AND (reason LIKE 'test-%')=?""",
+        (user_id, ALLOW_MOCK_PAY and not yookassa.configured()),
+    ).fetchone()[0]
+
+
+def _account_summary(connection, user_id, email):
+    return {"id": user_id, "email": email, "referral_code": user_id,
+            "balance_rub": _credit_balance(connection, user_id)}
 
 
 def _rate_limit(request: Request, scope: str, identity: str, limit: int, window: int):
@@ -363,7 +441,7 @@ def _quote(settings: Settings):
         "breakdown": [
             {"label": "Подготовка работы", "detail": f"Требования, логика и структура — {settings.work_type.lower()}", "amount_rub": base},
             {"label": "Написание основного текста", "detail": f"{pages} стр. × {rule['page']} ₽", "amount_rub": volume},
-            {"label": f"ИИ-модель {model['label']}", "detail": "Расход AITunnel с резервом на контекст и повтор запроса", "amount_rub": model_fee},
+            {"label": f"ИИ-модель {model['label']}", "detail": "Расчёт с учётом объёма и параметров задачи", "amount_rub": model_fee},
             *([{"label": "Поиск и проверка источников", "detail": f"Поиск по теме и разделам: {pages} стр. × 10 ₽", "amount_rub": search}] if search else []),
         ],
         "includes": [
@@ -388,13 +466,22 @@ def _order_response(row, breakdown=None, includes=None):
         "expires_at": row["expires_at"],
         "breakdown": breakdown or [],
         "includes": includes or [],
-        "payment_mode": "mock",
+        "payment_mode": "yookassa" if yookassa.configured() else "mock" if ALLOW_MOCK_PAY else "external",
     }
+
+
+def _order_available(connection, order_id):
+    if (not ALLOW_MOCK_PAY or yookassa.configured()) and connection.execute(
+        "SELECT 1 FROM account_credits WHERE id=? AND reason='test-order'", (order_id,)
+    ).fetchone():
+        raise HTTPException(402, "Тестовый заказ доступен только в тестовом режиме")
 
 
 def _paid_order(order_id: str, user_id: str, chat_id: str, prompt: str, settings: Settings):
     with _auth_connection() as connection:
         row = connection.execute("SELECT * FROM orders WHERE id=? AND user_id=?", (order_id, user_id)).fetchone()
+        if row:
+            _order_available(connection, order_id)
     if not row or row["chat_id"] != chat_id:
         raise HTTPException(404, "Заказ не найден")
     if row["status"] not in ("paid", "generating"):
@@ -423,7 +510,9 @@ CHATS = _load()
 
 def _save():
     STORE.parent.mkdir(parents=True, exist_ok=True)
-    STORE.write_text(json.dumps(CHATS, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary = STORE.with_suffix(".tmp")
+    temporary.write_text(json.dumps(CHATS, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(STORE)
 
 
 def _new_chat(user_id: str, work_type="Эссе"):
@@ -434,19 +523,55 @@ def _new_chat(user_id: str, work_type="Эссе"):
 
 
 def _chat(cid: str, user_id: str):
-    if cid not in CHATS or CHATS[cid].get("user_id") != user_id:
+    if cid not in CHATS or CHATS[cid].get("user_id") != user_id or CHATS[cid].get("deleted_at"):
         raise HTTPException(404, "Чат не найден")
     CHATS[cid]["updated_at"] = int(time.time())
     return CHATS[cid]
 
 
 def _purge_expired_chats():
-    cutoff = int(time.time()) - DATA_RETENTION_DAYS * 24 * 60 * 60
-    expired = [key for key, chat in CHATS.items() if chat.get("updated_at", chat.get("created_at", int(time.time()))) < cutoff]
-    for key in expired:
-        del CHATS[key]
+    now = int(time.time())
+    cutoff = now - DATA_RETENTION_DAYS * 24 * 60 * 60
+    expired = [
+        key for key, chat in CHATS.items()
+        if (chat["deleted_at"] <= now - DELETED_CHAT_RETENTION
+            if chat.get("deleted_at")
+            else chat.get("updated_at", chat.get("created_at", now)) < cutoff)
+    ]
     if expired:
+        with _auth_connection() as connection:
+            connection.executemany(
+                "UPDATE orders SET prompt='', settings_json='' WHERE chat_id=?",
+                [(key,) for key in expired],
+            )
+        for key in expired:
+            del CHATS[key]
         _save()
+
+
+def _purge_chats():
+    with LOCK:
+        _purge_expired_chats()
+
+
+async def _scheduled_purge():
+    while True:
+        try:
+            await asyncio.to_thread(_purge_chats)
+        except (OSError, sqlite3.Error):
+            logger.exception("Chat retention cleanup failed")
+        await asyncio.sleep(3600)
+
+
+@asynccontextmanager
+async def lifespan(app):
+    cleanup = asyncio.create_task(_scheduled_purge())
+    try:
+        yield
+    finally:
+        cleanup.cancel()
+        with suppress(asyncio.CancelledError):
+            await cleanup
 
 
 def _safe_public_url(raw_url: str):
@@ -545,8 +670,8 @@ def run_model(settings: Settings, system: str, messages: list[dict], use_search=
 def build_system(s: Settings, words=None, section=False):
     source_type = "веб-поиск" if s.use_search else "свои знания"
     current_style = s.style or "ясный, аналитический, живой, без канцелярита"
-    live_style = s.live_style if s.live_style_enabled else ""
-    extra = (SECTION_EXTRA + (live_style or "") + "\n" if section else "") + (s.extra or "")
+    live_style = (s.live_style.strip() or LIVE_STYLE_DEFAULT) if s.live_style_enabled else ""
+    extra = "\n".join(filter(None, (SECTION_EXTRA if section else "", live_style, s.extra)))
     system = f"""Ты — профессиональный автор текстов. Пишешь на языке: {s.language}.
 Тип работы: {s.work_type}. Приблизительный объём: {words or s.words} слов.
 
@@ -745,7 +870,7 @@ def md_to_docx(text):
     return buffer.getvalue()
 
 
-app = FastAPI(title="Writer Agent API", version="1.0.0", docs_url=None, redoc_url=None)
+app = FastAPI(title="Writer Agent API", version="1.0.0", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=sorted(ALLOWED_ORIGINS),
@@ -781,7 +906,21 @@ async def security_middleware(request: Request, call_next):
 
 @app.get("/api/meta")
 def meta():
-    return {"work_types": TYPE_INFO, "long_works": LONG_WORKS, "models": _model_catalog(), "model_prices_unit": "₽ за 1 млн токенов", "languages": ["русский", "английский", "немецкий", "нидерландский"], "default_model": DEFAULT_MODEL, "live_style": LIVE_STYLE_DEFAULT, "privacy_version": PRIVACY_VERSION, "payment_mode": "mock" if ALLOW_MOCK_PAY else "external"}
+    models = {id: {"label": model["label"], "tier": model["tier"]} for id, model in MODEL_OPTIONS.items()}
+    privacy = _legal_document("privacy")
+    offer = _legal_document("offer")
+    return {"work_types": TYPE_INFO, "long_works": LONG_WORKS, "models": models,
+            "languages": ["русский", "английский", "немецкий", "нидерландский"],
+            "default_model": DEFAULT_MODEL, "live_style": LIVE_STYLE_DEFAULT,
+            "privacy_version": privacy["version"] if privacy else PRIVACY_VERSION,
+            "offer_version": offer["version"] if offer else None,
+            "referral_reward_rub": REFERRAL_REWARD_RUB,
+            "payment_mode": "yookassa" if yookassa.configured() else "mock" if ALLOW_MOCK_PAY else "external"}
+
+
+@app.get("/api/legal/{kind}")
+def legal_document(kind: Literal["privacy", "offer"]):
+    return _legal_document(kind)
 
 
 @app.post("/api/auth/register", status_code=201)
@@ -790,19 +929,33 @@ def register(body: AuthRequest, response: Response, request: Request):
     _rate_limit(request, "register", email, 5, 15 * 60)
     if not body.privacy_accepted:
         raise HTTPException(422, "Необходимо принять политику обработки персональных данных")
+    privacy = _legal_document("privacy")
+    if privacy and body.privacy_version != privacy["version"]:
+        raise HTTPException(422, "Примите действующую политику обработки персональных данных")
+    if not ALLOW_MOCK_PAY and privacy is None:
+        raise HTTPException(503, "Политика обработки персональных данных ещё не опубликована")
     password_hash = _hash_password(body.password)
     user_id = uuid.uuid4().hex
+    now = int(time.time())
     try:
         with _auth_connection() as connection:
-            connection.execute("INSERT INTO users(id,email,password_hash,created_at) VALUES(?,?,?,?)", (user_id, email, password_hash, int(time.time())))
+            connection.execute("INSERT INTO users(id,email,password_hash,created_at) VALUES(?,?,?,?)", (user_id, email, password_hash, now))
             connection.execute(
                 "INSERT INTO consents(id,user_id,document,version,accepted_at) VALUES(?,?,?,?,?)",
-                (uuid.uuid4().hex, user_id, "privacy-policy", PRIVACY_VERSION, int(time.time())),
+                (uuid.uuid4().hex, user_id, "privacy-policy", privacy["version"] if privacy else PRIVACY_VERSION, now),
             )
+            _accept_offer(connection, user_id, body.offer_version, now)
+            referral_code = body.referral_code.strip().lower()
+            if referral_code:
+                inviter = connection.execute("SELECT id FROM users WHERE id=? AND id<>?", (referral_code, user_id)).fetchone()
+                if not inviter:
+                    raise HTTPException(422, "Реферальный код не найден")
+                connection.execute("INSERT INTO referrals(invitee_id,inviter_id) VALUES(?,?)", (user_id, inviter["id"]))
+            account = _account_summary(connection, user_id, email)
     except sqlite3.IntegrityError as exc:
         raise HTTPException(409, "Пользователь с таким email уже существует") from exc
     _create_session(user_id, response)
-    return {"id": user_id, "email": email}
+    return account
 
 
 @app.post("/api/auth/login")
@@ -814,7 +967,8 @@ def login(body: AuthRequest, response: Response, request: Request):
     if not row or not _verify_password(body.password, row["password_hash"]):
         raise HTTPException(401, "Неверный email или пароль")
     _create_session(row["id"], response)
-    return {"id": row["id"], "email": row["email"]}
+    with _auth_connection() as connection:
+        return _account_summary(connection, row["id"], row["email"])
 
 
 @app.post("/api/auth/logout", status_code=204)
@@ -827,18 +981,8 @@ def logout(response: Response, writer_session: str | None = Cookie(default=None)
 
 @app.get("/api/auth/me")
 def me(user=Depends(current_user)):
-    return user
-
-
-@app.get("/api/account/export")
-def export_account(user=Depends(current_user)):
     with _auth_connection() as connection:
-        consents = [dict(row) for row in connection.execute("SELECT document,version,accepted_at FROM consents WHERE user_id=?", (user["id"],))]
-        orders = [dict(row) for row in connection.execute("SELECT id,chat_id,work_type,words,pages,amount_rub,status,created_at,paid_at FROM orders WHERE user_id=?", (user["id"],))]
-    with LOCK:
-        chats = [chat for chat in CHATS.values() if chat.get("user_id") == user["id"]]
-    payload = json.dumps({"user": user, "consents": consents, "orders": orders, "chats": chats}, ensure_ascii=False, indent=2)
-    return Response(payload, media_type="application/json; charset=utf-8", headers={"Content-Disposition": 'attachment; filename="my-data.json"'})
+        return _account_summary(connection, user["id"], user["email"])
 
 
 @app.delete("/api/account", status_code=204)
@@ -883,31 +1027,195 @@ def create_quote(body: QuoteRequest, request: Request, user=Depends(current_user
     return _order_response(row, quote["breakdown"], quote["includes"])
 
 
-@app.post("/api/orders/{order_id}/mock-pay")
-def mock_pay(order_id: str, user=Depends(current_user)):
-    if not ALLOW_MOCK_PAY:
-        raise HTTPException(404, "Способ оплаты недоступен")
+def _yookassa_result(connection, row, payment):
+    result = _order_response(row)
+    result["confirmation_url"] = payment["confirmation_url"]
+    result["payment_status"] = payment["status"]
+    result["credit_rub"] = payment["credit_rub"]
+    return result
+
+
+def _sync_yookassa(connection, row, payment):
+    if payment["status"] in ("succeeded", "canceled"):
+        return _yookassa_result(connection, row, payment)
+    if payment["payment_id"]:
+        remote = yookassa.request("GET", f"payments/{payment['payment_id']}")
+    else:
+        # YooKassa retains idempotency keys for 24 hours. Never recreate an
+        # uncertain older payment automatically.
+        if time.time() - payment["created_at"] > 23 * 3600:
+            raise HTTPException(409, "Платёж требует проверки оператором")
+        remote = yookassa.request("POST", "payments", json.loads(payment["request_json"]), row["id"])
+    expected = json.loads(payment["request_json"])["amount"]
+    try:
+        valid_amount = Decimal(remote["amount"]["value"]) == Decimal(expected["value"])
+    except (KeyError, TypeError, InvalidOperation):
+        valid_amount = False
+    if (not valid_amount or remote.get("amount", {}).get("currency") != "RUB"
+            or remote.get("metadata", {}).get("order_id") != row["id"]
+            or not re.fullmatch(r"[a-zA-Z0-9-]{1,64}", remote.get("id", ""))
+            or (payment["payment_id"] and remote["id"] != payment["payment_id"])):
+        raise HTTPException(502, "Не удалось подтвердить параметры платежа")
+    status = remote.get("status")
+    if status not in ("pending", "waiting_for_capture", "succeeded", "canceled"):
+        raise HTTPException(502, "Неизвестный статус платежа")
+    if status == "succeeded" and remote.get("paid") is not True:
+        raise HTTPException(502, "Оплата ещё не подтверждена")
+    url = yookassa.confirmation_url(remote)
+    connection.execute(
+        "UPDATE yookassa_payments SET payment_id=?,status=?,confirmation_url=? WHERE order_id=?",
+        (remote["id"], status, url, row["id"]),
+    )
     now = int(time.time())
-    with _auth_connection() as connection:
+    if status == "succeeded":
+        connection.execute("UPDATE orders SET status='paid',paid_at=? WHERE id=? AND status='payment_pending'", (now, row["id"]))
+        # Test-shop payments must never fund the production referral balance.
+        if not remote.get("test", False):
+            connection.execute(
+                """INSERT INTO account_credits(id,user_id,amount_rub,reason,created_at)
+                   SELECT ?,inviter_id,?,'referral',? FROM referrals
+                   WHERE invitee_id=? AND inviter_id IS NOT NULL
+                   ON CONFLICT(id) DO NOTHING""",
+                (f"referral:{row['user_id']}", REFERRAL_REWARD_RUB, now, row["user_id"]),
+            )
+    elif status == "canceled":
+        connection.execute("UPDATE orders SET status='expired' WHERE id=? AND status='payment_pending'", (row["id"],))
+        if payment["credit_rub"]:
+            connection.execute(
+                """INSERT INTO account_credits(id,user_id,amount_rub,reason,created_at)
+                   VALUES(?,?,?,'payment-canceled',?) ON CONFLICT(id) DO NOTHING""",
+                (f"release:{row['id']}", row["user_id"], payment["credit_rub"], now),
+            )
+    row = connection.execute("SELECT * FROM orders WHERE id=?", (row["id"],)).fetchone()
+    payment = connection.execute("SELECT * FROM yookassa_payments WHERE order_id=?", (row["id"],)).fetchone()
+    return _yookassa_result(connection, row, payment)
+
+
+def _yookassa_pay(connection, row, payment, user):
+    existing = connection.execute("SELECT * FROM yookassa_payments WHERE order_id=?", (row["id"],)).fetchone()
+    if existing:
+        return _sync_yookassa(connection, row, existing)
+    if row["status"] != "awaiting_payment":
+        return _order_response(row)
+    now = int(time.time())
+    if row["expires_at"] < now:
+        raise HTTPException(409, "Срок действия цены истёк. Рассчитайте стоимость заново")
+    credit = payment.credit_rub
+    if credit > row["amount_rub"] or credit > _credit_balance(connection, user["id"]):
+        raise HTTPException(409, "Недостаточно средств на балансе")
+    remaining = row["amount_rub"] - credit
+    payload = None
+    if remaining:
+        payload = {
+            "amount": {"value": f"{remaining}.00", "currency": "RUB"},
+            "capture": True,
+            "confirmation": {"type": "redirect", "return_url": yookassa.return_url(row["id"])},
+            "description": f"Заказ {row['id']}",
+            "metadata": {"order_id": row["id"]},
+        }
+    _accept_offer(connection, user["id"], payment.offer_version, now)
+    connection.execute(
+        "INSERT INTO account_credits(id,user_id,amount_rub,reason,created_at) VALUES(?,?,?,'order',?)",
+        (row["id"], user["id"], -credit, now),
+    )
+    if not remaining:
+        connection.execute("UPDATE orders SET status='paid',paid_at=? WHERE id=?", (now, row["id"]))
+        return _order_response(connection.execute("SELECT * FROM orders WHERE id=?", (row["id"],)).fetchone())
+    connection.execute(
+        "INSERT INTO yookassa_payments(order_id,request_json,credit_rub,created_at) VALUES(?,?,?,?)",
+        (row["id"], json.dumps(payload), credit, now),
+    )
+    connection.execute("UPDATE orders SET status='payment_pending' WHERE id=?", (row["id"],))
+    # Persist the reservation and identical provider request before network I/O.
+    connection.commit()
+    connection.execute("BEGIN IMMEDIATE")
+    existing = connection.execute("SELECT * FROM yookassa_payments WHERE order_id=?", (row["id"],)).fetchone()
+    return _sync_yookassa(connection, row, existing)
+
+
+@app.get("/api/orders/{order_id}")
+def get_order(order_id: str, user=Depends(current_user)):
+    with LOCK, _auth_connection() as connection:
+        connection.execute("BEGIN IMMEDIATE")
         row = connection.execute("SELECT * FROM orders WHERE id=? AND user_id=?", (order_id, user["id"])).fetchone()
         if not row:
             raise HTTPException(404, "Заказ не найден")
-        if row["status"] == "awaiting_payment" and row["expires_at"] < now:
-            connection.execute("UPDATE orders SET status='expired' WHERE id=?", (order_id,))
+        payment = connection.execute("SELECT * FROM yookassa_payments WHERE order_id=?", (order_id,)).fetchone()
+        result = _sync_yookassa(connection, row, payment) if payment else _order_response(row)
+        result["prompt"] = row["prompt"]
+        result["settings"] = json.loads(row["settings_json"]) if row["settings_json"] else None
+        return result
+
+
+class YooKassaNotificationObject(BaseModel):
+    id: str = Field(pattern=r"^[a-zA-Z0-9-]{1,64}$")
+
+
+class YooKassaNotification(BaseModel):
+    event: Literal["payment.succeeded", "payment.canceled", "payment.waiting_for_capture"]
+    object: YooKassaNotificationObject
+
+
+@app.post("/api/payments/yookassa/webhook")
+def yookassa_webhook(body: YooKassaNotification):
+    # Treat the notification only as a trigger. Fetch authoritative status with
+    # this shop's credentials and match the stored amount and order metadata.
+    with LOCK, _auth_connection() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        payment = connection.execute("SELECT * FROM yookassa_payments WHERE payment_id=?", (body.object.id,)).fetchone()
+        if payment:
+            row = connection.execute("SELECT * FROM orders WHERE id=?", (payment["order_id"],)).fetchone()
+            _sync_yookassa(connection, row, payment)
+    return {"ok": True}
+
+
+@app.post("/api/orders/{order_id}/pay")
+@app.post("/api/orders/{order_id}/mock-pay", include_in_schema=False)
+def pay_order(order_id: str, body: PaymentRequest | None = None, user=Depends(current_user)):
+    payment = body or PaymentRequest()
+    now = int(time.time())
+    with LOCK, _auth_connection() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute("SELECT * FROM orders WHERE id=? AND user_id=?", (order_id, user["id"])).fetchone()
+        if not row:
+            raise HTTPException(404, "Заказ не найден")
+        _chat(row["chat_id"], user["id"])
+        _order_available(connection, order_id)
+        if yookassa.configured() or row["status"] == "payment_pending":
+            return _yookassa_pay(connection, row, payment, user)
+        if row["status"] == "expired" or (row["status"] == "awaiting_payment" and row["expires_at"] < now):
             raise HTTPException(409, "Срок действия цены истёк. Рассчитайте стоимость заново")
         if row["status"] == "awaiting_payment":
+            amount = row["amount_rub"]
+            credit = payment.credit_rub
+            if credit > amount or credit > _credit_balance(connection, user["id"]):
+                raise HTTPException(409, "Баланс изменился. Обновите страницу и повторите оплату")
+            if credit < amount and not ALLOW_MOCK_PAY:
+                raise HTTPException(503, "Оплата картой пока недоступна")
+            _accept_offer(connection, user["id"], payment.offer_version, now)
+            if credit or ALLOW_MOCK_PAY:
+                connection.execute(
+                    "INSERT INTO account_credits(id,user_id,amount_rub,reason,created_at) VALUES(?,?,?,?,?)",
+                    (order_id, user["id"], -credit, "test-order" if ALLOW_MOCK_PAY else "order", now),
+                )
             connection.execute("UPDATE orders SET status='paid',paid_at=? WHERE id=?", (now, order_id))
-        row = connection.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
-    return _order_response(row)
+            if ALLOW_MOCK_PAY and credit < amount:
+                connection.execute(
+                    """INSERT INTO account_credits(id,user_id,amount_rub,reason,created_at)
+                       SELECT ?,inviter_id,?,'test-referral',? FROM referrals
+                       WHERE invitee_id=? AND inviter_id IS NOT NULL
+                       ON CONFLICT(id) DO NOTHING""",
+                    (f"test-referral:{user['id']}", REFERRAL_REWARD_RUB, now, user["id"]),
+                )
+            row = connection.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
+        return _order_response(row)
 
 
 @app.get("/api/chats")
 def list_chats(user=Depends(current_user)):
     with LOCK:
         _purge_expired_chats()
-        own_chats = [c for c in CHATS.values() if c.get("user_id") == user["id"]]
-        if not own_chats:
-            own_chats = [_new_chat(user["id"])]
+        own_chats = [c for c in CHATS.values() if c.get("user_id") == user["id"] and not c.get("deleted_at")]
         return [{"id": c["id"], "title": c["title"], "work_type": c["work_type"]} for c in reversed(own_chats)]
 
 
@@ -926,7 +1234,12 @@ def get_chat(cid: str, user=Depends(current_user)):
 @app.delete("/api/chats/{cid}", status_code=204)
 def delete_chat(cid: str, user=Depends(current_user)):
     with LOCK:
-        _chat(cid, user["id"]); del CHATS[cid]; _save()
+        chat = CHATS.get(cid)
+        if not chat or chat.get("user_id") != user["id"]:
+            raise HTTPException(404, "Чат не найден")
+        if not chat.get("deleted_at"):
+            chat["deleted_at"] = int(time.time())
+            _save()
 
 
 @app.post("/api/chats/{cid}/messages")
@@ -979,13 +1292,17 @@ def write_work(cid: str, body: WriteRequest, request: Request, user=Depends(curr
         if not order_id:
             raise HTTPException(402, "Для этой работы нет оплаченного заказа")
         with _auth_connection() as connection:
+            _order_available(connection, order_id)
             order = connection.execute("SELECT status FROM orders WHERE id=? AND user_id=? AND chat_id=?", (order_id, user["id"], cid)).fetchone()
         if not order or order["status"] not in ("paid", "generating"):
             raise HTTPException(402, "Сначала оплатите заказ")
         written = lw.setdefault("written", {}); cites = lw.setdefault("cites", {})
         todo = [i for i, x in enumerate(lw["plan"]) if x["words"] > 0]
+        target = todo if body.section_indices is None else sorted(set(body.section_indices))
+        if any(index not in todo for index in target):
+            raise HTTPException(422, "Выбранный раздел отсутствует в плане")
         try:
-            for index in todo:
+            for index in target:
                 if str(index) in written: continue
                 section = lw["plan"][index]
                 previous = [i for i in todo if i < index and str(i) in written]
@@ -1004,6 +1321,8 @@ def write_work(cid: str, body: WriteRequest, request: Request, user=Depends(curr
                 ])
                 text, summary, new_cites = gen_section(body.settings, prompt, section["words"])
                 written[str(index)] = [text, summary]; cites.update(new_cites); _save()
+            if any(str(index) not in written for index in todo):
+                return chat
             lw["final"] = assemble(chat)
             words = len(re.findall(r"\w+", lw["final"]))
             chat["history"].append({"role": "assistant", "content": lw["final"], "api": f"[Работа написана полностью (~{words} слов) и показана пользователю]"})
@@ -1021,6 +1340,9 @@ def revise(cid: str, body: ReviseRequest, request: Request, user=Depends(current
     with LOCK:
         chat = _chat(cid, user["id"]); lw = chat["lw"]; key = str(body.section_index)
         if key not in lw.get("written", {}): raise HTTPException(409, "Раздел ещё не написан")
+        if order_id := lw.get("order_id"):
+            with _auth_connection() as connection:
+                _order_available(connection, order_id)
         section = lw["plan"][body.section_index]
         prompt = "\n\n".join([
             f"Тема работы и задание: {lw['topic']}",
@@ -1049,7 +1371,8 @@ def reset_work(cid: str, user=Depends(current_user)):
 
 @app.get("/api/chats/{cid}/download/{kind}")
 def download(cid: str, kind: Literal["md", "docx"], user=Depends(current_user)):
-    chat = _chat(cid, user["id"]); text = chat["lw"].get("final") or next((m["content"] for m in reversed(chat["history"]) if m["role"] == "assistant"), "")
+    with LOCK:
+        chat = _chat(cid, user["id"]); text = chat["lw"].get("final") or next((m["content"] for m in reversed(chat["history"]) if m["role"] == "assistant"), "")
     if not text: raise HTTPException(404, "Нет готового текста")
     if kind == "md": return Response(text, media_type="text/markdown; charset=utf-8", headers={"Content-Disposition": 'attachment; filename="result.md"'})
     return Response(md_to_docx(text), media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document", headers={"Content-Disposition": 'attachment; filename="work.docx"'})
